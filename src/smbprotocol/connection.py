@@ -136,6 +136,33 @@ class SigningAlgorithms:
     AES_GMAC = 0x0002
 
 
+class CompressionAlgorithms:
+    """
+    [MS-SMB2] 2.2.3.1.3 SMB2_COMPRESSION_CAPABILITIES
+
+    16-bit integer IDs that specify the supported compression algorithms.
+    """
+
+    SMB2_COMPRESSION_NONE = 0x0000
+    SMB2_COMPRESSION_LZNT1 = 0x0001
+    SMB2_COMPRESSION_LZ77 = 0x0002
+    SMB2_COMPRESSION_LZ77_HUFFMAN = 0x0003
+    SMB2_COMPRESSION_PATTERN_V1 = 0x0004
+
+
+class CompressionFlags:
+    """
+    [MS-SMB2] 2.2.42 SMB2 COMPRESSION_TRANSFORM_HEADER Flags
+
+    Used in both the SMB2_COMPRESSION_CAPABILITIES negotiate context Flags
+    field (chained compression support) and the compression transform header /
+    chained payload header Flags field.
+    """
+
+    SMB2_COMPRESSION_FLAG_NONE = 0x0000
+    SMB2_COMPRESSION_FLAG_CHAINED = 0x0001
+
+
 class SMB2NegotiateRequest(Structure):
     """
     [MS-SMB2] v53.0 2017-09-15
@@ -376,6 +403,8 @@ class SMB2NegotiateContextRequest(Structure):
             return SMB2PreauthIntegrityCapabilities
         elif con_type == NegotiateContextType.SMB2_ENCRYPTION_CAPABILITIES:
             return SMB2EncryptionCapabilities
+        elif con_type == NegotiateContextType.SMB2_COMPRESSION_CAPABILITIES:
+            return SMB2CompressionCapabilities
         elif con_type == NegotiateContextType.SMB2_NETNAME_NEGOTIATE_CONTEXT_ID:
             return SMB2NetnameNegotiateContextId
         elif con_type == NegotiateContextType.SMB2_SIGNING_CAPABILITIES:
@@ -516,6 +545,50 @@ class SMB2SigningCapabilities(Structure):
                         size=lambda s: s["signing_algorithm_count"].get_value() * 2,
                         list_count=lambda s: s["signing_algorithm_count"].get_value(),
                         list_type=EnumField(size=2, enum_type=SigningAlgorithms),
+                    ),
+                ),
+            ]
+        )
+        super().__init__()
+
+
+class SMB2CompressionCapabilities(Structure):
+    """
+    [MS-SMB2] 2.2.3.1.3 SMB2_COMPRESSION_CAPABILITIES
+
+    The SMB2_COMPRESSION_CAPABILITIES context is specified in an SMB2 NEGOTIATE
+    request by the client to indicate which compression algorithms it supports
+    and whether it supports chained compression. The server uses the same
+    format in the negotiate response.
+    """
+
+    def __init__(self):
+        self.fields = OrderedDict(
+            [
+                (
+                    "compression_algorithm_count",
+                    IntField(
+                        size=2,
+                        default=lambda s: len(s["compression_algorithms"].get_value()),
+                    ),
+                ),
+                ("padding", IntField(size=2)),
+                (
+                    "flags",
+                    FlagField(
+                        size=4,
+                        flag_type=CompressionFlags,
+                        flag_strict=False,
+                    ),
+                ),
+                (
+                    "compression_algorithms",
+                    ListField(
+                        size=lambda s: s["compression_algorithm_count"].get_value() * 2,
+                        list_count=lambda s: s["compression_algorithm_count"].get_value(),
+                        # Future algorithms (e.g. LZ4) must not fail to unpack, the
+                        # negotiated list is still validated against what was offered.
+                        list_type=EnumField(size=2, enum_type=CompressionAlgorithms, enum_strict=False),
                     ),
                 ),
             ]
@@ -843,13 +916,29 @@ class Connection:
         # The signing algorithm that was negotiated
         self.signing_algorithm_id = None
 
+        # SMB 3.1.1+ compression
+        # The compression algorithm ids negotiated with the server, in the
+        # server's order of preference. Empty when compression was not offered
+        # or not negotiated. Reset on every connect().
+        self.compression_algorithms = []
+
+        # Whether the server agreed to chained compression
+        self.supports_chained_compression = False
+
         # Keep track of the message processing thread's potential traceback that it may raise.
         self._t_exc = None
 
         # The thread that will handle message processing.
         self._t_worker = None
 
-    def connect(self, dialect=None, timeout=60, preferred_encryption_algos=None, preferred_signing_algos=None):
+    def connect(
+        self,
+        dialect=None,
+        timeout=60,
+        preferred_encryption_algos=None,
+        preferred_signing_algos=None,
+        preferred_compression_algos=None,
+    ):
         """
         Will connect to the target server and negotiate the capabilities
         with the client. Once setup, the client MUST call the disconnect()
@@ -886,7 +975,18 @@ class Connection:
         :param preferred_signing_algos: A list of signing algorithm ids in
             priority order from highest to lowest.
             See :class:`SigningAlgorithms` for a list of known identifiers.
+        :param preferred_compression_algos: A list of compression algorithm ids
+            in priority order from highest to lowest, e.g.
+            ``[CompressionAlgorithms.SMB2_COMPRESSION_LZNT1]``. Only offered
+            when SMB 3.1.1 is negotiated. When unset or empty no compression
+            capabilities context is sent and the on-the-wire behaviour is
+            unchanged.
         """
+        # Reset the state for this new connection attempt.
+        self.compression_algorithms = []
+        self.supports_chained_compression = False
+        self._t_exc = None
+
         log.info("Setting up transport connection")
         self.transport = Tcp(self.server_name, self.port, timeout)
         self.transport.connect()
@@ -908,7 +1008,10 @@ class Connection:
             SigningAlgorithms.AES_CMAC,
             SigningAlgorithms.HMAC_SHA256,
         ]
-        smb_response = self._send_smb2_negotiate(dialect, timeout, enc_algos, sign_algos)
+        compression_algos = list(preferred_compression_algos or [])
+        smb_response = self._send_smb2_negotiate(
+            dialect, timeout, enc_algos, sign_algos, compression_algos
+        )
         log.info("Negotiated dialect: %s", smb_response["dialect_revision"])
         self.dialect = smb_response["dialect_revision"].get_value()
         self.max_transact_size = smb_response["max_transact_size"].get_value()
@@ -960,6 +1063,26 @@ class Connection:
 
                 elif context_type == NegotiateContextType.SMB2_SIGNING_CAPABILITIES:
                     self.signing_algorithm_id = context["data"]["signing_algorithms"][0]
+
+                elif context_type == NegotiateContextType.SMB2_COMPRESSION_CAPABILITIES:
+                    # Only honour algorithms the client actually offered (the
+                    # server selects from that list) and drop NONE which is not
+                    # a real compression algorithm.
+                    offered = set(compression_algos)
+                    server_algos = context["data"]["compression_algorithms"].get_value()
+                    self.compression_algorithms = [
+                        algo
+                        for algo in server_algos
+                        if algo in offered and algo != CompressionAlgorithms.SMB2_COMPRESSION_NONE
+                    ]
+                    self.supports_chained_compression = context["data"]["flags"].has_flag(
+                        CompressionFlags.SMB2_COMPRESSION_FLAG_CHAINED
+                    )
+                    log.info(
+                        "Negotiated compression algorithms: %s (chained: %s)",
+                        self.compression_algorithms,
+                        self.supports_chained_compression,
+                    )
 
     def disconnect(self, close=True, timeout=None):
         """
@@ -1332,6 +1455,16 @@ class Connection:
         if related:
             requests[0].related_ids = [r.message["message_id"].get_value() for r in requests][1:]
 
+        # Compression happens after the message was signed (the signature
+        # covers the uncompressed bytes) but before encryption. Only single,
+        # non-compound messages are compressed; compound requests are sent as
+        # is. The negotiate request is never compressed as compression has not
+        # been negotiated at that point.
+        if total_requests == 1:
+            compressed_data = self._compress_message(send_data)
+            if compressed_data is not None:
+                send_data = compressed_data
+
         if session and session.encrypt_data or tree and tree.encrypt_data:
             send_data = self._encrypt(send_data, session)
 
@@ -1381,6 +1514,13 @@ class Connection:
                     msg = SMB2TransformHeader()
                     msg.unpack(b_msg)
                     b_msg = self._decrypt(msg)
+
+                # Encryption wraps compression, so the compression transform
+                # (if present) is only visible after decryption. Any failure
+                # here is fatal: the exception propagates to the outer handler
+                # which disconnects the connection and fails all requests.
+                if b_msg[:4] == b"\xfcSMB":
+                    b_msg = self._decompress_message(b_msg)
 
                 next_command = -1
                 while next_command != 0:
@@ -1551,7 +1691,218 @@ class Connection:
         dec_message = c.decrypt(nonce, enc_message, message.pack()[20:52])
         return dec_message
 
-    def _send_smb2_negotiate(self, dialect, timeout, encryption_algorithms, signing_algorithms):
+    def _compress_message(self, b_data):
+        """
+        Compresses a single, non-compound SMB2 message per [MS-SMB2] 2.2.42.
+
+        Returns the compression transform message when the compressed form is
+        strictly shorter, otherwise None so the caller sends the original data.
+        LZNT1 is the only algorithm used to compress. Chained capable peers get
+        a chained transform containing one LZNT1 payload, other peers get the
+        unchained form with the whole message compressed from Offset 0.
+        """
+        if self.dialect is None or self.dialect < Dialects.SMB_3_1_1:
+            return None
+        if CompressionAlgorithms.SMB2_COMPRESSION_LZNT1 not in self.compression_algorithms:
+            return None
+
+        original_size = len(b_data)
+        compressed = lznt1_compress(b_data)
+
+        if self.supports_chained_compression:
+            # SMB2_COMPRESSION_TRANSFORM_HEADER_CHAINED (8 bytes) followed by a
+            # single SMB2_COMPRESSION_CHAINED_PAYLOAD_HEADER. The LZNT1 stream
+            # may contain its own uncompressed chunks, so this never grows
+            # beyond the raw data plus the per-chunk headers.
+            payload_header = struct.pack(
+                "<HHI",
+                CompressionAlgorithms.SMB2_COMPRESSION_LZNT1,
+                CompressionFlags.SMB2_COMPRESSION_FLAG_CHAINED,
+                4 + len(compressed),  # Length includes the OriginalPayloadSize field
+            )
+            payload_header += struct.pack("<I", original_size)
+            message = b"\xfcSMB" + struct.pack("<I", original_size) + payload_header + compressed
+        else:
+            # SMB2_COMPRESSION_TRANSFORM_HEADER_UNCHAINED (16 bytes), the whole
+            # message is compressed and there is no uncompressed prefix.
+            header = b"\xfcSMB" + struct.pack(
+                "<IHHI",
+                original_size,
+                CompressionAlgorithms.SMB2_COMPRESSION_LZNT1,
+                CompressionFlags.SMB2_COMPRESSION_FLAG_NONE,
+                0,
+            )
+            message = header + compressed
+
+        if len(message) >= original_size:
+            return None
+
+        return message
+
+    def _decompress_compression_payload(self, algorithm, data, expected_size):
+        if algorithm == CompressionAlgorithms.SMB2_COMPRESSION_LZNT1:
+            try:
+                decompressed = lznt1_decompress(data)
+            except ValueError as err:
+                raise SMBException(f"Failed to decompress LZNT1 compression payload: {err}") from err
+        else:
+            raise SMBException(f"Received compressed data using the unsupported algorithm {algorithm}")
+
+        if len(decompressed) != expected_size:
+            raise SMBException(
+                f"Decompressed payload size {len(decompressed)} does not match the declared size {expected_size}"
+            )
+
+        return decompressed
+
+    def _decompress_message(self, b_msg):
+        """
+        Decompresses an SMB2 COMPRESSION_TRANSFORM_HEADER message per
+        [MS-SMB2] 3.1.5.2/3.1.5.3 and returns the original SMB2 message bytes.
+
+        Any protocol violation raises SMBException which the receive worker
+        treats as a fatal error: the connection is disconnected and all current
+        and future requests fail rather than risk processing bad data.
+        """
+        if not self.compression_algorithms:
+            raise SMBException("Received a compressed SMB2 message when compression was not negotiated")
+
+        message_size = len(b_msg)
+        # Both the unchained (16 byte) and chained (8 byte header plus at least
+        # one 8 byte payload header) transforms are at least 16 bytes long.
+        if message_size < 16:
+            raise SMBException("Compressed SMB2 message is smaller than the SMB2 compression transform header")
+
+        original_size = struct.unpack("<I", b_msg[4:8])[0]
+        algorithm = struct.unpack("<H", b_msg[8:10])[0]
+        flags = struct.unpack("<H", b_msg[10:12])[0]
+
+        # [MS-SMB2] 3.3.5.2.1.2 bounds the advertised original size based on the
+        # negotiated maximum message sizes to guard against decompression bombs.
+        max_negotiated = max(self.max_transact_size or 0, self.max_read_size or 0, self.max_write_size or 0)
+        max_original_size = 256 + 16 + max_negotiated
+        if original_size > max_original_size:
+            raise SMBException(
+                f"Compressed SMB2 message declares {original_size} bytes which exceeds the maximum "
+                f"{max_original_size} bytes"
+            )
+
+        if flags == CompressionFlags.SMB2_COMPRESSION_FLAG_NONE:
+            # SMB2_COMPRESSION_TRANSFORM_HEADER_UNCHAINED (16 bytes).
+            if (
+                algorithm == CompressionAlgorithms.SMB2_COMPRESSION_NONE
+                or algorithm not in self.compression_algorithms
+            ):
+                raise SMBException(f"Unchained compressed message uses the unnegotiated algorithm {algorithm}")
+
+            offset = struct.unpack("<I", b_msg[12:16])[0]
+            if offset > original_size or 16 + offset > message_size:
+                raise SMBException("Unchained compressed message offset is outside of the message")
+
+            prefix = bytes(b_msg[16 : 16 + offset])
+            compressed_data = bytes(b_msg[16 + offset :])
+            decompressed = self._decompress_compression_payload(
+                algorithm, compressed_data, original_size - offset
+            )
+            output = prefix + decompressed
+
+        elif flags == CompressionFlags.SMB2_COMPRESSION_FLAG_CHAINED:
+            if not self.supports_chained_compression:
+                raise SMBException("Received a chained compressed SMB2 message but chained compression was not agreed")
+
+            output = bytearray()
+            pos = 8
+
+            # Each chain entry consists of the 8 byte
+            # SMB2_COMPRESSION_CHAINED_PAYLOAD_HEADER followed by Length bytes.
+            while pos < message_size:
+                remaining = message_size - pos
+                if remaining < 8:
+                    raise SMBException("Truncated chained compression payload header")
+
+                segment_algorithm = struct.unpack("<H", b_msg[pos : pos + 2])[0]
+                segment_length = struct.unpack("<I", b_msg[pos + 4 : pos + 8])[0]
+
+                # The 8 byte payload header plus Length bytes must fit in the
+                # remaining message data.
+                if segment_length > remaining - 8:
+                    raise SMBException("Chained compression payload length exceeds the remaining message data")
+
+                if (
+                    segment_algorithm != CompressionAlgorithms.SMB2_COMPRESSION_NONE
+                    and segment_algorithm not in self.compression_algorithms
+                ):
+                    raise SMBException(
+                        f"Chained compressed message uses the unnegotiated algorithm {segment_algorithm}"
+                    )
+
+                payload_offset = pos + 8
+                if segment_algorithm == CompressionAlgorithms.SMB2_COMPRESSION_NONE:
+                    # The raw Length bytes are appended verbatim.
+                    if segment_length > original_size:
+                        raise SMBException("NONE compression payload exceeds the declared original message size")
+                    segment_data = b_msg[payload_offset : payload_offset + segment_length]
+                    if len(output) + segment_length > original_size:
+                        raise SMBException("Chained payloads decompress to more than the declared message size")
+                    output += segment_data
+
+                elif segment_algorithm == CompressionAlgorithms.SMB2_COMPRESSION_PATTERN_V1:
+                    # SMB2_COMPRESSION_PATTERN_PAYLOAD_V1 (8 bytes):
+                    # Pattern (1), Reserved1 (1), Reserved2 (2), Repetitions (4).
+                    if segment_length < 8:
+                        raise SMBException("Truncated Pattern_V1 compression payload")
+
+                    pattern = b_msg[payload_offset]
+                    repetitions = struct.unpack("<I", b_msg[payload_offset + 4 : payload_offset + 8])[0]
+                    if repetitions > original_size:
+                        raise SMBException("Pattern_V1 repetitions exceed the declared original message size")
+                    if len(output) + repetitions > original_size:
+                        raise SMBException("Chained payloads decompress to more than the declared message size")
+                    output += bytes([pattern]) * repetitions
+
+                else:
+                    # An LZ-style segment: OriginalPayloadSize (4 bytes) is the
+                    # first part of the Length bytes, the remainder is the
+                    # compressed payload.
+                    if segment_length < 4:
+                        raise SMBException("Truncated compressed chained payload")
+
+                    segment_original_size = struct.unpack("<I", b_msg[payload_offset : payload_offset + 4])[0]
+                    if len(output) + segment_original_size > original_size:
+                        raise SMBException("Chained payloads decompress to more than the declared message size")
+
+                    compressed_data = bytes(b_msg[payload_offset + 4 : payload_offset + segment_length])
+                    segment_data = self._decompress_compression_payload(
+                        segment_algorithm, compressed_data, segment_original_size
+                    )
+                    output += segment_data
+
+                pos += 8 + segment_length
+
+            output = bytes(output)
+
+        else:
+            raise SMBException(f"Unknown SMB2 compression transform flags value {flags}")
+
+        if len(output) != original_size:
+            raise SMBException(
+                f"Decompressed message size {len(output)} does not match the declared size {original_size}"
+            )
+
+        if output[:4] != b"\xfeSMB":
+            raise SMBException("Decompressed SMB2 message does not start with the SMB2 protocol id")
+
+        return output
+
+    def _send_smb2_negotiate(
+        self,
+        dialect,
+        timeout,
+        encryption_algorithms,
+        signing_algorithms,
+        compression_algorithms=None,
+    ):
+        compression_algorithms = compression_algorithms or []
         self.salt = os.urandom(32)
 
         if dialect is None:
@@ -1625,6 +1976,17 @@ class Connection:
             enc_cap["data"]["ciphers"] = supported_ciphers
             log.debug("Adding encryption capabilities of AES128|256 GCM and AES128|256 CCM to negotiate request")
 
+            negotiate_contexts = [int_cap, enc_cap]
+
+            if compression_algorithms:
+                comp_cap = SMB2NegotiateContextRequest()
+                comp_cap["context_type"] = NegotiateContextType.SMB2_COMPRESSION_CAPABILITIES
+                comp_cap["data"] = SMB2CompressionCapabilities()
+                comp_cap["data"]["compression_algorithms"] = list(compression_algorithms)
+                comp_cap["data"]["flags"] = CompressionFlags.SMB2_COMPRESSION_FLAG_CHAINED
+                negotiate_contexts.append(comp_cap)
+                log.debug("Adding compression capabilities %s to negotiate request", compression_algorithms)
+
             netname_id = SMB2NegotiateContextRequest()
             netname_id["context_type"] = NegotiateContextType.SMB2_NETNAME_NEGOTIATE_CONTEXT_ID
             netname_id["data"] = SMB2NetnameNegotiateContextId()
@@ -1641,12 +2003,8 @@ class Connection:
             signing_cap["padding"].size = 0
             signing_cap["padding"] = b""
 
-            neg_req["negotiate_context_list"] = [
-                int_cap,
-                enc_cap,
-                netname_id,
-                signing_cap,
-            ]
+            negotiate_contexts.extend([netname_id, signing_cap])
+            neg_req["negotiate_context_list"] = negotiate_contexts
 
         log.info("Sending SMB2 Negotiate message")
         log.debug(neg_req)
@@ -1767,3 +2125,193 @@ class Request:
         self.response_event = new_request.response_event
         self.response_event_lock = new_request.response_event_lock
         self.related_ids = new_request.related_ids
+
+
+# LZNT1 compression as defined in [MS-XCA] 2.4. The algorithm works on 4096
+# byte blocks ("chunks") that are compressed independently. A compressed
+# block starts with a control byte per group of up to 8 tokens where each bit
+# denotes a literal (0) or a back-reference (1, 2 byte LE match token).
+LZNT1_CHUNK_SIZE = 0x1000
+_LZNT1_COMPRESSED_CHUNK_SIGNATURE = 0xB000
+_LZNT1_UNCOMPRESSED_CHUNK_SIGNATURE = 0x3000
+
+
+def _lznt1_match_limits(output_length):
+    # The match token splits the 16 bits between the back-reference length and
+    # offset based on how much data has already been produced in the block. The
+    # first 16 bytes favour the length, the boundary shifts as the block grows.
+    pos = output_length - 1
+    length_mask = 0xFFF
+    offset_shift = 12
+    while pos >= 0x10:
+        length_mask >>= 1
+        offset_shift -= 1
+        pos >>= 1
+
+    return length_mask, offset_shift
+
+
+def _lznt1_compress_chunk(chunk):
+    chunk_size = len(chunk)
+
+    # Greedy LZ77 matcher using 3-byte hash chains. Blocks are at most 4096
+    # bytes so a plain list for the chain links is cheap and keeps the search
+    # bounded.
+    head = {}
+    previous = [-1] * chunk_size
+    tokens = []
+
+    def key(pos):
+        return (chunk[pos] * 529 + chunk[pos + 1] * 23 + chunk[pos + 2]) & 0xFFFF
+
+    pos = 0
+    while pos < chunk_size:
+        best_length = 0
+        best_offset = 0
+
+        if pos + 2 < chunk_size:
+            length_mask, offset_shift = _lznt1_match_limits(pos)
+            max_match_length = min(length_mask + 3, chunk_size - pos, LZNT1_CHUNK_SIZE - pos)
+            max_offset = 1 << (16 - offset_shift)
+
+            candidate = head.get(key(pos), -1)
+            searches = 0
+            while candidate >= 0 and pos - candidate <= max_offset and searches < 64:
+                match_length = 0
+                # Reading past the candidate start is valid, the overlap is
+                # resolved byte by byte when decompressing (RLE expansion).
+                while match_length < max_match_length and chunk[candidate + match_length] == chunk[pos + match_length]:
+                    match_length += 1
+
+                if match_length > best_length:
+                    best_length = match_length
+                    best_offset = pos - candidate
+                    if match_length == max_match_length:
+                        break
+
+                candidate = previous[candidate]
+                searches += 1
+
+            previous[pos] = head.get(key(pos), -1)
+            head[key(pos)] = pos
+
+        if best_length >= 3:
+            length_mask, offset_shift = _lznt1_match_limits(pos)
+            token = ((best_offset - 1) << offset_shift) | ((best_length - 3) & length_mask)
+            tokens.append((True, struct.pack("<H", token)))
+
+            # Record the positions skipped by the match so later matches can
+            # reference them.
+            for skipped in range(pos + 1, pos + best_length):
+                if skipped + 2 < chunk_size:
+                    previous[skipped] = head.get(key(skipped), -1)
+                    head[key(skipped)] = skipped
+
+            pos += best_length
+        else:
+            tokens.append((False, bytes([chunk[pos]])))
+            pos += 1
+
+    body = bytearray()
+    for group_start in range(0, len(tokens), 8):
+        group = tokens[group_start : group_start + 8]
+        flags = 0
+        for idx, (is_match, _) in enumerate(group):
+            if is_match:
+                flags |= 1 << idx
+
+        body.append(flags)
+        for _, token_data in group:
+            body += token_data
+
+    return bytes(body)
+
+
+def _lznt1_decompress_chunk(chunk):
+    output = bytearray()
+    pos = 0
+    chunk_size = len(chunk)
+
+    while pos < chunk_size:
+        flags = chunk[pos]
+        pos += 1
+
+        for bit in range(8):
+            if pos >= chunk_size:
+                break
+
+            if not (flags & (1 << bit)):
+                # Literal byte.
+                output.append(chunk[pos])
+                pos += 1
+                continue
+
+            if pos + 2 > chunk_size:
+                raise ValueError("LZNT1 match token exceeds the compressed chunk")
+
+            token = chunk[pos] | (chunk[pos + 1] << 8)
+            pos += 2
+
+            length_mask, offset_shift = _lznt1_match_limits(len(output))
+            match_length = (token & length_mask) + 3
+            match_offset = (token >> offset_shift) + 1
+
+            if match_offset > len(output):
+                raise ValueError("LZNT1 match token references data before the start of the chunk")
+            if len(output) + match_length > LZNT1_CHUNK_SIZE:
+                raise ValueError("LZNT1 chunk decompresses to more than 4096 bytes")
+
+            # Copy byte by byte as a match may overlap itself (RLE runs).
+            start = len(output) - match_offset
+            for i in range(match_length):
+                output.append(output[start + i])
+
+    return bytes(output)
+
+
+def lznt1_compress(data):
+    """Compress bytes using LZNT1 ([MS-XCA] 2.4) and return the byte stream."""
+    compressed = bytearray()
+    for block_start in range(0, len(data), LZNT1_CHUNK_SIZE):
+        chunk = data[block_start : block_start + LZNT1_CHUNK_SIZE]
+        body = _lznt1_compress_chunk(chunk)
+        if len(body) < len(chunk):
+            # Bit 0x8000 marks a compressed chunk, the low 12 bits store the
+            # compressed body length minus 1.
+            compressed += struct.pack("<H", _LZNT1_COMPRESSED_CHUNK_SIGNATURE | (len(body) - 1))
+            compressed += body
+        else:
+            compressed += struct.pack("<H", _LZNT1_UNCOMPRESSED_CHUNK_SIGNATURE | (len(chunk) - 1))
+            compressed += chunk
+
+    return bytes(compressed)
+
+
+def lznt1_decompress(data):
+    """Decompress an LZNT1 ([MS-XCA] 2.4) byte stream."""
+    output = bytearray()
+    pos = 0
+    total = len(data)
+
+    while pos < total:
+        if total - pos < 2:
+            raise ValueError("Truncated LZNT1 chunk header")
+
+        header = data[pos] | (data[pos + 1] << 8)
+        pos += 2
+
+        chunk_length = (header & 0x0FFF) + 1
+        if pos + chunk_length > total:
+            raise ValueError("LZNT1 chunk length exceeds the remaining data")
+
+        chunk = data[pos : pos + chunk_length]
+        pos += chunk_length
+
+        if header & 0x8000:
+            output += _lznt1_decompress_chunk(chunk)
+        else:
+            if len(chunk) > LZNT1_CHUNK_SIZE:
+                raise ValueError("Uncompressed LZNT1 chunk exceeds 4096 bytes")
+            output += chunk
+
+    return bytes(output)

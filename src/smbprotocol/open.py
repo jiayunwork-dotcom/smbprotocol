@@ -1338,6 +1338,9 @@ class Open:
                 )
             read["flags"].set_flag(ReadFlags.SMB2_READFLAG_READ_UNBUFFERED)
 
+        if self.connection.compression_algorithms and self.tree_connect.compress_data:
+            read["flags"].set_flag(ReadFlags.SMB2_READFLAG_REQUEST_COMPRESSED)
+
         if not send:
             return read, self._read_response
 

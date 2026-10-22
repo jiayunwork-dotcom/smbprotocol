@@ -229,6 +229,9 @@ class TreeConnect:
         self.encrypt_data = None
         self.is_scaleout_share = None
 
+        # SMB 3.1.1+ compression: whether the share has SMB2_SHAREFLAG_COMPRESS_DATA
+        self.compress_data = False
+
     def connect(self, require_secure_negotiate=True, use_dfs=True):
         """
         Connect to the share.
@@ -263,6 +266,7 @@ class TreeConnect:
         capabilities = tree_response["capabilities"]
         self.is_dfs_share = use_dfs and capabilities.has_flag(ShareCapabilities.SMB2_SHARE_CAP_DFS)
         self.is_ca_share = capabilities.has_flag(ShareCapabilities.SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY)
+        self.compress_data = tree_response["share_flags"].has_flag(ShareFlags.SMB2_SHAREFLAG_COMPRESS_DATA)
 
         dialect = self.session.connection.dialect
         if dialect >= Dialects.SMB_3_0_0 and self.session.connection.supports_encryption:
